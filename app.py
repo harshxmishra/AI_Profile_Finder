@@ -413,14 +413,36 @@ def page_view_results() -> None:
 
     bestfits = df["best_fit"].dropna().astype(str).unique().tolist()
     bestfit_filter = st.sidebar.multiselect("Best Fit", bestfits, default=bestfits)
-
-    min_conf = int(pd.to_numeric(df["confidence"], errors="coerce").fillna(0).min()) if len(df) else 0
-    max_conf = int(pd.to_numeric(df["confidence"], errors="coerce").fillna(100).max()) if len(df) else 100
-    conf_range = st.sidebar.slider("Confidence range", min_conf, max_conf, (min_conf, max_conf))
-
-    min_total = int(pd.to_numeric(df["total_score"], errors="coerce").fillna(0).min()) if len(df) else 0
-    max_total = int(pd.to_numeric(df["total_score"], errors="coerce").fillna(20).max()) if len(df) else 20
-    total_range = st.sidebar.slider("Total score range", min_total, max_total, (min_total, max_total))
+    
+    conf_series = pd.to_numeric(df["confidence"], errors="coerce").fillna(0)
+    min_conf = int(conf_series.min()) if len(df) else 0
+    max_conf = int(conf_series.max()) if len(df) else 100
+    
+    if min_conf == max_conf:
+        conf_range = (min_conf, max_conf)
+        st.sidebar.caption(f"Confidence range: {min_conf}")
+    else:
+        conf_range = st.sidebar.slider(
+            "Confidence range",
+            min_value=min_conf,
+            max_value=max_conf,
+            value=(min_conf, max_conf),
+        )
+    
+    total_series = pd.to_numeric(df["total_score"], errors="coerce").fillna(0)
+    min_total = int(total_series.min()) if len(df) else 0
+    max_total = int(total_series.max()) if len(df) else 20
+    
+    if min_total == max_total:
+        total_range = (min_total, max_total)
+        st.sidebar.caption(f"Total score range: {min_total}")
+    else:
+        total_range = st.sidebar.slider(
+            "Total score range",
+            min_value=min_total,
+            max_value=max_total,
+            value=(min_total, max_total),
+        )
 
     view_df = df.copy()
     view_df = view_df[view_df["tier"].isin(tier_filter)]
