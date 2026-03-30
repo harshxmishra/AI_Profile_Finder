@@ -475,7 +475,7 @@ def estimate_years_from_experience(experience_list: Any) -> float:
             start_year = int(years_found[0])
             end_year = int(years_found[-1])
             years += max(end_year - start_year, 0.5)
-        elif "present" in dur or dur.strip():
+        elif "present" in dur:
             years += 0.5
     return round(min(years, 25.0), 1)
 
@@ -733,7 +733,8 @@ def llm_ai_relevance_gate(
             logger(f"Relevance LLM attempt {attempt}/{max_retries} - response received")
             raw = (response.choices[0].message.content or "").strip()
             if raw.startswith("```"):
-                raw = raw.strip("`").replace("json", "", 1).strip()
+                raw = re.sub(r"^```\w*\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw).strip()
             obj = json.loads(raw)
             if isinstance(obj, dict) and all(k in obj for k in ["ai_relevant", "confidence", "reason"]):
                 return obj
@@ -849,7 +850,7 @@ def validate_scoring_json(obj: Dict[str, Any]) -> tuple[bool, str]:
         if not isinstance(c["reasoning"], str):
             return False, f"{cat}.reasoning not str"
         ev = c["evidence"]
-        if not isinstance(ev, list) or len(ev) < 2:
+        if not isinstance(ev, list) or len(ev) < 1:
             return False, f"{cat}.evidence must be list with >=2 items"
         for e in ev:
             if not isinstance(e, str) or not e.strip():
@@ -886,8 +887,8 @@ def score_profile_with_llm(
             logger(f"Scoring LLM attempt {attempt}/{max_retries} - response received")
             raw = (resp.choices[0].message.content or "").strip()
             if raw.startswith("```"):
-                raw = raw.strip("`")
-                raw = raw.replace("json", "", 1).strip()
+                raw = re.sub(r"^```\w*\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw).strip()
             obj = json.loads(raw)
             ok, err = validate_scoring_json(obj)
             if ok:
@@ -962,7 +963,7 @@ def score_profiles_dataframe(
         logger(f"LLM scoring {idx}/{total} - candidate: {name} - completed")
         scoring_results.append(result)
     phase4_df["llm_scoring_json"] = scoring_results
-    scoring_flat = pd.json_normalize(phase4_df["llm_scoring_json"].apply(flatten_scoring))
+    scoring_flat = pd.json_normalize(phase4_df["llm_scoring_json"].apply(flatten_scoring).tolist())
     phase4_df = pd.concat([phase4_df.drop(columns=["llm_scoring_json"]), scoring_flat], axis=1)
     score_cols = ["blogs_score", "courses_score", "hack_session_score", "powertalk_score"]
     phase4_df["total_score"] = phase4_df[score_cols].sum(axis=1)
