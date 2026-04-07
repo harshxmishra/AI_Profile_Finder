@@ -188,6 +188,75 @@ def build_actor_input(
 
 
 
+def generate_keyword_batches(
+    natural_language_query: str,
+    client: OpenAI,
+    model: str = "gpt-4.1-mini",
+    logger: Callable[[str], None] = default_logger,
+) -> List[List[str]]:
+    """Convert a natural language query into 3 focused keyword groups for Apify searches."""
+    logger(f"Generating keyword batches for: {natural_language_query}")
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{
+            "role": "user",
+            "content": f"""You are a LinkedIn search specialist. Convert this request into 3 focused keyword groups for LinkedIn people search.
+
+Request: {natural_language_query}
+
+Rules:
+- Output ONLY a JSON object with a "batches" key containing an array of 3 arrays
+- Each inner array has 2-4 keywords targeting one angle of the request
+- Use specific LinkedIn-style terms: job titles, skills, roles, content types
+- No Boolean operators, no parentheses, just plain terms
+- Each group should find slightly different but relevant people
+- Location is handled separately — never include geography in the terms
+
+Example output for "AI keynote speakers":
+{{"batches": [["AI keynote speaker", "artificial intelligence speaker"], ["machine learning conference speaker", "ML keynote"], ["AI thought leader", "GenAI speaker"]]}}
+
+Output JSON only."""
+        }],
+        response_format={"type": "json_object"},
+    )
+    data = json.loads(response.choices[0].message.content)
+    batches: List[List[str]] = data.get("batches", [])
+    if not batches:
+        logger("Warning: GPT returned empty batches, falling back to query as single keyword")
+        batches = [[natural_language_query]]
+    logger(f"Generated {len(batches)} keyword batches: {batches}")
+    return batches
+
+
+def fetch_profiles_multi_batch(
+    keyword_batches: List[List[str]],
+    location: Optional[List[str]],
+    limit_per_batch: int,
+    apify_client: ApifyClient,
+    actor_id: str = DEFAULT_ACTOR_ID,
+    logger: Callable[[str], None] = default_logger,
+) -> List[Dict[str, Any]]:
+    """Run one Apify search per keyword batch and deduplicate results by LinkedIn URL."""
+    all_profiles: List[Dict[str, Any]] = []
+    seen_urls: set = set()
+
+    for i, batch in enumerate(keyword_batches):
+        logger(f"Batch {i + 1}/{len(keyword_batches)}: keywords={batch}, limit={limit_per_batch}")
+        run_input = build_actor_input(keywords=batch, location=location, limit=limit_per_batch)
+        profiles = fetch_profiles_from_apify(run_input=run_input, client=apify_client, actor_id=actor_id, logger=logger)
+        new_count = 0
+        for p in profiles:
+            url = (p.get("url") or p.get("linkedinUrl") or "").strip()
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                all_profiles.append(p)
+                new_count += 1
+        logger(f"Batch {i + 1} added {new_count} new profiles (total unique so far: {len(all_profiles)})")
+
+    logger(f"Multi-batch fetch complete. Total unique profiles: {len(all_profiles)}")
+    return all_profiles
+
+
 def fetch_profiles_from_apify(
     run_input: Dict[str, Any],
     client: ApifyClient,
@@ -833,9 +902,32 @@ Dossier:
 
 
 
+_BEST_FIT_ALIASES = {
+    "blogs": "Blogs",
+    "blog": "Blogs",
+    "courses": "Courses",
+    "course": "Courses",
+    "hack session": "Hack Session",
+    "hack sessions": "Hack Session",
+    "hack_session": "Hack Session",
+    "powertalk": "PowerTalk",
+    "power talk": "PowerTalk",
+}
+
+def _normalize_best_fit(value: Any) -> str:
+    if isinstance(value, str):
+        normalized = _BEST_FIT_ALIASES.get(value.strip().lower())
+        if normalized:
+            return normalized
+    return value
+
+
 def validate_scoring_json(obj: Dict[str, Any]) -> tuple[bool, str]:
     if not isinstance(obj, dict):
         return False, "Not a dict"
+    # Normalize best_fit before validation so minor GPT variations don't fail
+    if "best_fit" in obj:
+        obj["best_fit"] = _normalize_best_fit(obj["best_fit"])
     for k in SCORING_KEYS:
         if k not in obj:
             return False, f"Missing key: {k}"
@@ -845,6 +937,9 @@ def validate_scoring_json(obj: Dict[str, Any]) -> tuple[bool, str]:
             return False, f"{cat} is not a dict"
         if "score" not in c or "reasoning" not in c or "evidence" not in c:
             return False, f"{cat} missing score/reasoning/evidence"
+        score = c["score"]
+        if isinstance(score, float):
+            c["score"] = int(score)
         if not isinstance(c["score"], int) or not (0 <= c["score"] <= 5):
             return False, f"{cat}.score invalid"
         if not isinstance(c["reasoning"], str):
@@ -857,6 +952,9 @@ def validate_scoring_json(obj: Dict[str, Any]) -> tuple[bool, str]:
                 return False, f"{cat}.evidence contains empty"
     if obj["best_fit"] not in ["Blogs", "Courses", "Hack Session", "PowerTalk"]:
         return False, "best_fit invalid"
+    confidence = obj["confidence"]
+    if isinstance(confidence, float):
+        obj["confidence"] = int(confidence)
     if not isinstance(obj["confidence"], int) or not (0 <= obj["confidence"] <= 100):
         return False, "confidence invalid"
     if not isinstance(obj["risk_flags"], list):
@@ -870,7 +968,7 @@ def score_profile_with_llm(
     client: OpenAI,
     model: str = "gpt-4.1-mini",
     max_retries: int = 3,
-    sleep_s: float = 1.0,
+    sleep_s: float = 1.5,
     logger: Callable[[str], None] = default_logger,
 ) -> Dict[str, Any]:
     prompt = build_scoring_prompt(dossier_text)
@@ -881,14 +979,12 @@ def score_profile_with_llm(
             resp = client.chat.completions.create(
                 model=model,
                 temperature=0,
+                response_format={"type": "json_object"},
                 messages=[{"role": "user", "content": prompt}],
                 timeout=60.0,
             )
             logger(f"Scoring LLM attempt {attempt}/{max_retries} - response received")
             raw = (resp.choices[0].message.content or "").strip()
-            if raw.startswith("```"):
-                raw = re.sub(r"^```\w*\s*", "", raw)
-                raw = re.sub(r"\s*```$", "", raw).strip()
             obj = json.loads(raw)
             ok, err = validate_scoring_json(obj)
             if ok:
@@ -899,6 +995,12 @@ def score_profile_with_llm(
         except Exception as e:
             last_error = str(e)
             logger(f"Scoring LLM attempt {attempt}/{max_retries} failed: {e}")
+            # Exponential backoff on rate limit errors
+            if "rate_limit" in str(e).lower() or "429" in str(e):
+                wait = sleep_s * (3 ** attempt)
+                logger(f"Rate limit hit — waiting {wait:.0f}s before retry")
+                time.sleep(wait)
+                continue
             prompt = build_scoring_prompt(dossier_text) + "\n\nYour previous output was not valid JSON. Output ONLY valid JSON with the exact schema."
         time.sleep(sleep_s)
     fallback_reason = "Scoring failed after retries."
@@ -962,6 +1064,8 @@ def score_profiles_dataframe(
         result = score_profile_with_llm(row.get("dossier_text", ""), client=client, model=model, logger=logger)
         logger(f"LLM scoring {idx}/{total} - candidate: {name} - completed")
         scoring_results.append(result)
+        if idx < total:
+            time.sleep(1.0)  # avoid rate limit bursts on rapid sequential calls
     phase4_df["llm_scoring_json"] = scoring_results
     scoring_flat = pd.json_normalize(phase4_df["llm_scoring_json"].apply(flatten_scoring).tolist())
     phase4_df = pd.concat([phase4_df.drop(columns=["llm_scoring_json"]), scoring_flat], axis=1)
@@ -1061,7 +1165,7 @@ def save_dataframe(df: pd.DataFrame, path: str | Path, logger: Callable[[str], N
 
 
 def run_full_pipeline(
-    keywords: List[str] | str,
+    natural_language_query: str,
     location: Optional[List[str] | str] = None,
     limit: int = 50,
     output_dir: str = DEFAULT_OUTPUT_DIR,
@@ -1077,8 +1181,11 @@ def run_full_pipeline(
     base_dir = ensure_dir(output_dir)
     raw_dir = ensure_dir(base_dir / DEFAULT_RAW_DIRNAME)
 
+    if isinstance(location, str):
+        location = [location]
+
     plog.log(f"Pipeline starting. Output dir: {base_dir}")
-    plog.log(f"Keywords: {keywords}")
+    plog.log(f"Query: {natural_language_query}")
     plog.log(f"Locations: {location}")
     plog.log(f"Limit: {limit}")
     plog.log("Initializing clients...")
@@ -1086,9 +1193,17 @@ def run_full_pipeline(
     openai_client = get_openai_client(openai_api_key)
     plog.log("Clients initialized successfully")
 
-    plog.log("Running Phase 1: fetch profiles from Apify")
-    run_input = build_actor_input(keywords=keywords, location=location, limit=limit)
-    raw_items = fetch_profiles_from_apify(run_input=run_input, client=apify_client, actor_id=actor_id, logger=plog.log)
+    plog.log("Running Phase 1: generating keyword batches and fetching profiles")
+    keyword_batches = generate_keyword_batches(natural_language_query, openai_client, model=relevance_model, logger=plog.log)
+    limit_per_batch = max(10, limit // len(keyword_batches))
+    raw_items = fetch_profiles_multi_batch(
+        keyword_batches=keyword_batches,
+        location=location,
+        limit_per_batch=limit_per_batch,
+        apify_client=apify_client,
+        actor_id=actor_id,
+        logger=plog.log,
+    )
     save_raw_profiles(raw_items, raw_dir, logger=plog.log)
     phase1_df = convert_to_dataframe(raw_items, logger=plog.log)
     phase1_csv_path = save_dataframe(phase1_df, base_dir / DEFAULT_PHASE1_CSV, logger=plog.log)
@@ -1185,7 +1300,9 @@ __all__ = [
     "PipelineArtifacts",
     "DASHBOARD_REQUIRED_COLUMNS",
     "build_actor_input",
+    "generate_keyword_batches",
     "fetch_profiles_from_apify",
+    "fetch_profiles_multi_batch",
     "save_raw_profiles",
     "convert_to_dataframe",
     "normalize_profiles_dataframe",
