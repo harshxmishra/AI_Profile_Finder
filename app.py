@@ -223,7 +223,7 @@ def drain_pipeline_queue() -> None:
 # Background thread target
 # ---------------------------------------------------------------------------
 def _pipeline_thread_target(
-    keywords: List[str],
+    natural_language_query: str,
     locations: List[str],
     limit: int,
     output_dir: Path,
@@ -237,7 +237,7 @@ def _pipeline_thread_target(
 
     try:
         artifacts = run_full_pipeline(
-            keywords=keywords,
+            natural_language_query=natural_language_query,
             location=locations,
             limit=limit,
             output_dir=output_dir,
@@ -250,7 +250,7 @@ def _pipeline_thread_target(
 
 
 def start_pipeline_thread(
-    keywords: List[str],
+    natural_language_query: str,
     locations: List[str],
     limit: int,
     output_dir: Path,
@@ -260,7 +260,7 @@ def start_pipeline_thread(
 
     thread = threading.Thread(
         target=_pipeline_thread_target,
-        args=(keywords, locations, limit, output_dir, log_q),
+        args=(natural_language_query, locations, limit, output_dir, log_q),
         daemon=True,
     )
     thread.start()
@@ -414,7 +414,7 @@ def page_run_pipeline() -> None:
     with st.expander("How this page works", expanded=False):
         st.markdown(
             """
-- Enter keywords and location, then click **Run pipeline**.
+- Describe who you're looking for in plain English. The AI will generate 3 focused keyword batches and run separate LinkedIn searches for each, then deduplicate the results before scoring.
 - The phase tracker and logs update automatically every second.
 - Download per-phase CSVs as soon as they're ready — no need to wait for the full run.
 - If the pipeline errors mid-run, the logs panel will show exactly where it failed.
@@ -426,10 +426,10 @@ def page_run_pipeline() -> None:
     # ------------------------------------------------------------------
     if not st.session_state.pipeline_running:
         with st.form("pipeline_form"):
-            query_text = st.text_area(
-                "Search query keywords",
-                value="AI speaker, GenAI workshop, LLM trainer",
-                help="Comma-separated keywords passed into the Apify actor.",
+            nl_query = st.text_area(
+                "Describe who you're looking for",
+                value="AI and machine learning speakers who give keynote talks at conferences",
+                help="Describe the type of person you want to find. The AI will convert this into targeted LinkedIn search keywords.",
             )
             location_text = st.text_input(
                 "Location filter",
@@ -440,11 +440,11 @@ def page_run_pipeline() -> None:
             submitted = st.form_submit_button("🚀 Run pipeline", use_container_width=True)
 
         if submitted:
-            keywords = [x.strip() for x in query_text.split(",") if x.strip()]
+            nl_query = nl_query.strip()
             locations = [x.strip() for x in location_text.split(",") if x.strip()]
 
-            if not keywords:
-                st.error("Please provide at least one keyword.")
+            if not nl_query:
+                st.error("Please describe who you're looking for.")
                 st.stop()
             if not os.getenv("APIFY_API_TOKEN"):
                 st.error("APIFY_API_TOKEN is missing.")
@@ -457,7 +457,7 @@ def page_run_pipeline() -> None:
             st.session_state.run_id = uuid.uuid4().hex[:10]
             output_dir = OUTPUTS_ROOT / f"run_{st.session_state.run_id}"
 
-            start_pipeline_thread(keywords, locations, limit, output_dir)
+            start_pipeline_thread(nl_query, locations, limit, output_dir)
             st.rerun()  # jump immediately into the running state below
 
     # ------------------------------------------------------------------
